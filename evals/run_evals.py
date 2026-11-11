@@ -43,6 +43,7 @@ def main():
     parser.add_argument('--max-steps', type=int, default=None, help='Giới hạn model calls mỗi case: mặc định 8, bonus 16')
     parser.add_argument('--workers', type=int, default=1, help='Số case chạy đồng thời (mặc định 1)')
     parser.add_argument('--output', default='eval_results.json')
+    parser.add_argument('--resume-unscored', action='store_true', help='Chỉ chạy lại các case chưa chấm trong --output')
     args = parser.parse_args()
     args.judge_provider = args.judge_provider or args.provider
     args.judge_model = args.judge_model or args.model
@@ -56,16 +57,42 @@ def main():
     selected = [c for c in cases if not args.case or c['id'] == args.case.upper()]
     if not selected:
         parser.error('Không tìm thấy case')
+    config = {'provider': args.provider, 'model': args.model,
+              'judge_provider': args.judge_provider, 'judge_model': args.judge_model,
+              'max_steps': args.max_steps, 'dataset': 'bonus' if args.bonus else 'core'}
+    previous = None
+    if args.resume_unscored:
+        if args.case:
+            parser.error('--resume-unscored không dùng cùng --case')
+        output_path = Path(args.output)
+        if not output_path.is_file():
+            parser.error(f'Không tìm thấy file để tiếp tục: {output_path}')
+        previous = json.loads(output_path.read_text(encoding='utf-8'))
+        if previous.get('config') != config:
+            parser.error('Cấu hình trong file cũ khác lần chạy này')
+        old_cases = previous.get('cases', [])
+        if [c.get('id') for c in old_cases] != [c['id'] for c in selected]:
+            parser.error('Danh sách case trong file cũ khác dataset hiện tại')
+        pending_ids = {c['id'] for c in old_cases if c.get('grade', {}).get('score') is None}
+        print(f'Giữ {len(selected) - len(pending_ids)} case đã chấm; chạy lại {len(pending_ids)} case chưa chấm.', flush=True)
+        pending = [c for c in selected if c['id'] in pending_ids]
+    else:
+        pending = selected
     def run_and_print(case):
         print(f"Đang chạy {case['id']}", flush=True)
         item = run_case(case, args)
         print(f"{case['id']}: {item['grade'].get('score')} ({item['grade']['status']})", flush=True)
         return item
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        results = list(pool.map(run_and_print, selected))
-    report = {'summary': summarize(results), 'config': {'provider': args.provider, 'model': args.model,
-              'judge_provider': args.judge_provider, 'judge_model': args.judge_model, 'max_steps': args.max_steps,
-              'dataset': 'bonus' if args.bonus else 'core'}, 'cases': results}
+        rerun_results = list(pool.map(run_and_print, pending))
+    if previous is not None:
+        rerun_by_id = {item['id']: item for item in rerun_results}
+        results = [rerun_by_id.get(item['id'], item) for item in previous['cases']]
+    else:
+        results = rerun_results
+    report = {'summary': summarize(results), 'config': config, 'cases': results}
+    if previous is not None:
+        report['resume_history'] = previous.get('resume_history', []) + [{'rerun_unscored_cases': [c['id'] for c in pending]}]
     summary = report['summary']
     if args.bonus:
         full_run = not args.case and len(selected) == len(cases)
